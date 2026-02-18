@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   FiBarChart2,
   FiBell,
@@ -97,8 +97,11 @@ const pageMeta = {
   },
   cnic: {
     title: 'CNIC & Inventory Check',
-    subtitle: 'Verify customer CNICs and match stock availability.',
-    endpoint: '/api/cnic-checks',
+    subtitle: 'Search customer records using CNIC number.',
+    endpoint: '/api/customers',
+    allowCreate: false,
+    allowEdit: false,
+    allowDelete: false,
   },
   inventory: {
     title: 'Inventory',
@@ -291,21 +294,16 @@ const moduleFormMap = {
     ],
   },
   cnic: {
-    label: 'CNIC Check',
-    list: { title: 'customerName', subtitle: 'cnic', meta: ['status'] },
+    label: 'Customer',
+    list: { title: 'fullName', subtitle: 'cnic', meta: ['primaryPhone', 'address'] },
     sections: [
       {
-        title: 'CNIC Check',
+        title: 'Customer Lookup',
         fields: [
-          { name: 'customerName', label: 'Customer Name', type: 'text' },
+          { name: 'fullName', label: 'Customer Name', type: 'text' },
           { name: 'cnic', label: 'CNIC', type: 'text', required: true },
-          {
-            name: 'status',
-            label: 'Status',
-            type: 'select',
-            options: ['Verified', 'Pending', 'Rejected'],
-          },
-          { name: 'remarks', label: 'Remarks', type: 'textarea' },
+          { name: 'primaryPhone', label: 'Primary Phone', type: 'text' },
+          { name: 'address', label: 'Address', type: 'textarea' },
         ],
       },
     ],
@@ -507,6 +505,19 @@ const motionVariants = {
   }),
 }
 
+const dashboardRangeOptions = [
+  { key: '7d', label: 'Last 7 Days', points: 7 },
+  { key: '30d', label: 'Last 30 Days', points: 30 },
+  { key: '90d', label: 'Last 90 Days', points: 90 },
+  { key: 'all', label: 'All Time', points: null },
+]
+
+const dashboardCurrencyOptions = [
+  { key: 'USD', symbol: '$', rate: 1 },
+  { key: 'PKR', symbol: 'Rs ', rate: 278 },
+  { key: 'EUR', symbol: 'EUR ', rate: 0.92 },
+]
+
 function App() {
   const [dashboard, setDashboard] = useState(fallbackDashboard)
   const [loading, setLoading] = useState(true)
@@ -525,7 +536,13 @@ function App() {
     password: '',
   })
   const [moduleSearch, setModuleSearch] = useState('')
+  const [topSearch, setTopSearch] = useState('')
+  const [dashboardRange, setDashboardRange] = useState('30d')
+  const [dashboardCurrency, setDashboardCurrency] = useState('USD')
+  const [dashboardReloadTick, setDashboardReloadTick] = useState(0)
   const [isFormOpen, setIsFormOpen] = useState(false)
+  const [isNotificationOpen, setIsNotificationOpen] = useState(false)
+  const [isDashboardFilterOpen, setIsDashboardFilterOpen] = useState(false)
   const [formMode, setFormMode] = useState('create')
   const [formData, setFormData] = useState({})
   const [formError, setFormError] = useState('')
@@ -537,6 +554,8 @@ function App() {
     reports: false,
     administration: false,
   })
+  const notificationRef = useRef(null)
+  const dashboardFilterRef = useRef(null)
   const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:4000'
 
   const apiFetch = async (path, options = {}) => {
@@ -562,6 +581,8 @@ function App() {
     setToken('')
     setAuthUser(null)
     setActiveItem('dashboard')
+    setIsNotificationOpen(false)
+    setIsDashboardFilterOpen(false)
   }
 
   const handleLoginChange = (event) => {
@@ -635,7 +656,7 @@ function App() {
       mounted = false
       controller.abort()
     }
-  }, [apiBase, token])
+  }, [apiBase, dashboardReloadTick, token])
 
   useEffect(() => {
     let mounted = true
@@ -740,18 +761,170 @@ function App() {
 
   useEffect(() => {
     setModuleSearch('')
+    setTopSearch('')
+    setIsNotificationOpen(false)
+    setIsDashboardFilterOpen(false)
   }, [activeItem])
 
+  useEffect(() => {
+    const handleOutsideClick = (event) => {
+      if (
+        notificationRef.current &&
+        !notificationRef.current.contains(event.target)
+      ) {
+        setIsNotificationOpen(false)
+      }
+      if (
+        dashboardFilterRef.current &&
+        !dashboardFilterRef.current.contains(event.target)
+      ) {
+        setIsDashboardFilterOpen(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handleOutsideClick)
+    return () => {
+      document.removeEventListener('mousedown', handleOutsideClick)
+    }
+  }, [])
+
+  const selectedRangeOption =
+    dashboardRangeOptions.find((item) => item.key === dashboardRange) ||
+    dashboardRangeOptions[1]
+  const selectedCurrencyOption =
+    dashboardCurrencyOptions.find((item) => item.key === dashboardCurrency) ||
+    dashboardCurrencyOptions[0]
+
+  const parseNumber = (value) => {
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null
+    if (typeof value !== 'string') return null
+    const normalized = value.replace(/[^0-9.-]/g, '')
+    if (!normalized) return null
+    const parsed = Number(normalized)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+
+  const formatCurrency = (value, compact = false) => {
+    const numericValue = Number(value) || 0
+    if (compact) {
+      if (Math.abs(numericValue) >= 1_000_000) {
+        return `${selectedCurrencyOption.symbol}${(numericValue / 1_000_000).toFixed(1)}m`
+      }
+      if (Math.abs(numericValue) >= 1_000) {
+        return `${selectedCurrencyOption.symbol}${(numericValue / 1_000).toFixed(0)}k`
+      }
+    }
+    return `${selectedCurrencyOption.symbol}${numericValue.toLocaleString('en-US', {
+      maximumFractionDigits: 0,
+    })}`
+  }
+
+  const dashboardView = useMemo(() => {
+    const rangePoints = selectedRangeOption.points
+    const rate = selectedCurrencyOption.rate
+    const symbol = selectedCurrencyOption.symbol
+    const currencySensitive = /revenue|sales|amount|cash|price|balance|income|payment/i
+    const sliceByRange = (rows) => {
+      if (!Array.isArray(rows)) return []
+      if (!rangePoints) return rows
+      return rows.slice(Math.max(rows.length - rangePoints, 0))
+    }
+    const scaled = (value) => {
+      const numeric = parseNumber(value)
+      return numeric === null ? null : numeric * rate
+    }
+
+    const revenue = sliceByRange(dashboard.revenue).map((item) => ({
+      ...item,
+      current: scaled(item.current) ?? 0,
+      previous: scaled(item.previous) ?? 0,
+    }))
+
+    const streams = sliceByRange(dashboard.streams).map((item) => ({
+      ...item,
+      amountNumeric: scaled(item.amount),
+    }))
+
+    const salesBreakdown = sliceByRange(dashboard.salesBreakdown).map((item) => ({
+      ...item,
+      value: scaled(item.value) ?? 0,
+    }))
+
+    const funnel = sliceByRange(dashboard.funnel)
+    const kpis = dashboard.kpis.map((item) => {
+      const shouldScale = currencySensitive.test(String(item.label || ''))
+      const value = shouldScale ? scaled(item.value) : null
+      return {
+        ...item,
+        displayValue:
+          value === null
+            ? item.value
+            : `${symbol}${(Number(value) || 0).toLocaleString('en-US', {
+                maximumFractionDigits: 0,
+              })}`,
+      }
+    })
+
+    return {
+      ...dashboard,
+      kpis,
+      revenue,
+      streams,
+      funnel,
+      salesBreakdown,
+    }
+  }, [
+    dashboard,
+    selectedCurrencyOption.rate,
+    selectedCurrencyOption.symbol,
+    selectedRangeOption.points,
+  ])
+
   const revenueMax = useMemo(() => {
-    const values = dashboard.revenue.map((item) => item.current)
+    const values = dashboardView.revenue.map((item) => Number(item.current) || 0)
     return Math.max(...values, 16000)
-  }, [dashboard.revenue])
+  }, [dashboardView.revenue])
+
+  const breakdownMax = useMemo(() => {
+    const values = dashboardView.salesBreakdown.map((item) => Number(item.value) || 0)
+    return Math.max(...values, 1)
+  }, [dashboardView.salesBreakdown])
 
   const currentPage = pageMeta[activeItem] || pageMeta.dashboard
   const moduleRows = moduleCache[activeItem] || []
   const moduleFormConfig = moduleFormMap[activeItem]
   const moduleLabel = moduleFormConfig?.label || currentPage.title
   const listConfig = moduleFormConfig?.list
+  const isCnicLookup = activeItem === 'cnic'
+  const dashboardSearchTerm = topSearch.trim().toLowerCase()
+
+  const notificationItems = useMemo(() => {
+    if (Array.isArray(dashboard.notifications)) {
+      return dashboard.notifications.map((item, index) => {
+        if (typeof item === 'string') {
+          return {
+            id: `notif-${index}`,
+            title: item,
+            detail: 'New update',
+          }
+        }
+        return {
+          id: item.id || `notif-${index}`,
+          title: item.title || item.message || 'Notification',
+          detail: item.detail || item.time || 'New update',
+        }
+      })
+    }
+
+    const count = Number(dashboard.notifications) || 0
+    return Array.from({ length: count }, (_, index) => ({
+      id: `notif-${index}`,
+      title: `Notification ${index + 1}`,
+      detail: 'System update available',
+    }))
+  }, [dashboard.notifications])
+
+  const notificationCount = notificationItems.length
 
   const formatValue = (value) => {
     if (value === null || value === undefined) return '-'
@@ -808,6 +981,10 @@ function App() {
     return []
   }, [moduleFormConfig, derivedFields])
 
+  const canCreate = currentPage.allowCreate !== false && formSections.length > 0
+  const canEdit = currentPage.allowEdit !== false
+  const canDelete = currentPage.allowDelete !== false
+
   const filteredRows = useMemo(() => {
     if (!moduleSearch) return moduleRows
     const term = moduleSearch.toLowerCase()
@@ -818,12 +995,82 @@ function App() {
     )
   }, [moduleRows, moduleSearch])
 
+  const cnicSearchTerm = String(moduleSearch || '').replace(/\D/g, '')
+
+  const cnicRows = useMemo(() => {
+    if (!cnicSearchTerm) return []
+    const normalize = (value) => String(value || '').replace(/\D/g, '')
+    return moduleRows.filter((row) =>
+      normalize(row?.cnic).includes(cnicSearchTerm),
+    )
+  }, [cnicSearchTerm, moduleRows])
+
+  const moduleRecordCount = isCnicLookup ? cnicRows.length : filteredRows.length
+
+  const dashboardSearchResults = useMemo(() => {
+    if (!dashboardSearchTerm) return []
+    const symbol = selectedCurrencyOption.symbol
+
+    const toText = (value) => {
+      if (value === null || value === undefined) return '-'
+      if (typeof value === 'object') return JSON.stringify(value)
+      return String(value)
+    }
+
+    const results = []
+    const addResult = (section, label, value, extra = '') => {
+      const text = `${section} ${label} ${value} ${extra}`.toLowerCase()
+      if (text.includes(dashboardSearchTerm)) {
+        results.push({
+          id: `${section}-${label}-${results.length}`,
+          section,
+          label,
+          value: toText(value),
+          extra: toText(extra),
+        })
+      }
+    }
+
+    dashboardView.kpis.forEach((item) => {
+      addResult('KPI', item.label, item.displayValue || item.value, item.delta)
+    })
+    dashboardView.streams.forEach((item) => {
+      addResult(
+        'Revenue Stream',
+        item.label,
+        item.amountNumeric === null
+          ? item.amount
+          : `${symbol}${(Number(item.amountNumeric) || 0).toLocaleString('en-US', {
+              maximumFractionDigits: 0,
+            })}`,
+        `${item.share || 0}%`,
+      )
+    })
+    dashboardView.funnel.forEach((item) => {
+      addResult('Sales Funnel', item.name, item.value)
+    })
+    dashboardView.salesBreakdown.forEach((item) => {
+      addResult('Sales Breakdown', item.name, item.value)
+    })
+    dashboardView.revenue.forEach((item) => {
+      addResult('Revenue', item.name, item.current, item.previous)
+    })
+
+    return results.slice(0, 40)
+  }, [dashboardSearchTerm, dashboardView, selectedCurrencyOption.symbol])
+
   const handleToggle = (key, defaultChild) => {
     const isOpen = openGroups[key]
     setOpenGroups((prev) => ({ ...prev, [key]: !prev[key] }))
     if (!isOpen && defaultChild) {
       setActiveItem(defaultChild)
     }
+  }
+
+  const handleDashboardRefresh = () => {
+    setLoading(true)
+    setDashboardReloadTick((prev) => prev + 1)
+    setIsDashboardFilterOpen(false)
   }
 
   const getRowId = (row) => row?._id || row?.id
@@ -867,6 +1114,14 @@ function App() {
     event.preventDefault()
     const meta = pageMeta[activeItem]
     if (!meta?.endpoint) return
+    if (formMode === 'create' && !canCreate) {
+      setFormError('Create is disabled for this module.')
+      return
+    }
+    if (formMode === 'edit' && !canEdit) {
+      setFormError('Edit is disabled for this module.')
+      return
+    }
     setFormSaving(true)
     setFormError('')
     try {
@@ -893,6 +1148,10 @@ function App() {
   const handleDelete = async (row) => {
     const meta = pageMeta[activeItem]
     if (!meta?.endpoint) return
+    if (!canDelete) {
+      setModuleError('Delete is disabled for this module.')
+      return
+    }
     const rowId = getRowId(row)
     if (!rowId) return
     const confirmed = window.confirm('Delete this record?')
@@ -1118,16 +1377,56 @@ function App() {
             <FiSearch />
             <input
               type="text"
-              placeholder="Search orders, products, customers..."
+              placeholder={
+                activeItem === 'dashboard'
+                  ? 'Search dashboard metrics...'
+                  : `Search ${moduleLabel.toLowerCase()}...`
+              }
+              value={activeItem === 'dashboard' ? topSearch : moduleSearch}
+              onChange={(event) => {
+                const { value } = event.target
+                if (activeItem === 'dashboard') {
+                  setTopSearch(value)
+                } else {
+                  setModuleSearch(value)
+                }
+              }}
             />
           </div>
           <div className="topbar-actions">
-            <button className="icon-button">
-              <FiBell />
-              {dashboard.notifications > 0 && (
-                <span className="badge">{dashboard.notifications}</span>
+            <div className="notification-wrap" ref={notificationRef}>
+              <button
+                className="icon-button"
+                type="button"
+                onClick={() => setIsNotificationOpen((prev) => !prev)}
+                aria-label="Toggle notifications"
+              >
+                <FiBell />
+                {notificationCount > 0 && (
+                  <span className="badge">{notificationCount}</span>
+                )}
+              </button>
+              {isNotificationOpen && (
+                <div className="notifications-popover glass">
+                  <div className="notifications-head">
+                    <strong>Notifications</strong>
+                    <span>{notificationCount}</span>
+                  </div>
+                  {notificationCount === 0 ? (
+                    <p className="notifications-empty">No new notifications.</p>
+                  ) : (
+                    <div className="notifications-list">
+                      {notificationItems.map((item) => (
+                        <div key={item.id} className="notification-item">
+                          <p>{item.title}</p>
+                          <span>{item.detail}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               )}
-            </button>
+            </div>
             <div className="profile">
               <div className="avatar">SA</div>
               <div>
@@ -1145,27 +1444,107 @@ function App() {
             <p className="subtitle">{currentPage.subtitle}</p>
           </div>
           {activeItem === "dashboard" && (
-            <div className="filters glass">
-              <span>Last 30 Days</span>
-              <span className="dot">|</span>
-              <span>Now</span>
-              <span className="dot">|</span>
-              <span>USD</span>
-              <FiChevronDown />
+            <div className="filters-wrap" ref={dashboardFilterRef}>
+              <button
+                className="filters glass"
+                type="button"
+                onClick={() => setIsDashboardFilterOpen((prev) => !prev)}
+              >
+                <span>{selectedRangeOption.label}</span>
+                <span className="dot">|</span>
+                <span>{loading ? 'Syncing' : 'Now'}</span>
+                <span className="dot">|</span>
+                <span>{selectedCurrencyOption.key}</span>
+                <FiChevronDown className={isDashboardFilterOpen ? 'open' : ''} />
+              </button>
+              {isDashboardFilterOpen && (
+                <div className="filters-menu glass">
+                  <div className="filters-group">
+                    <p>Range</p>
+                    {dashboardRangeOptions.map((option) => (
+                      <button
+                        key={option.key}
+                        type="button"
+                        className={`filters-option ${
+                          dashboardRange === option.key ? 'active' : ''
+                        }`}
+                        onClick={() => {
+                          setDashboardRange(option.key)
+                          setIsDashboardFilterOpen(false)
+                        }}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="filters-group">
+                    <p>Currency</p>
+                    {dashboardCurrencyOptions.map((option) => (
+                      <button
+                        key={option.key}
+                        type="button"
+                        className={`filters-option ${
+                          dashboardCurrency === option.key ? 'active' : ''
+                        }`}
+                        onClick={() => {
+                          setDashboardCurrency(option.key)
+                          setIsDashboardFilterOpen(false)
+                        }}
+                      >
+                        {option.key}
+                      </button>
+                    ))}
+                  </div>
+                  <button
+                    type="button"
+                    className="filters-option refresh"
+                    onClick={handleDashboardRefresh}
+                  >
+                    Refresh Now
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </section>
 
                         {activeItem === 'dashboard' ? (
-          dashboard.kpis.length === 0 &&
-          dashboard.revenue.length === 0 &&
-          dashboard.funnel.length === 0 &&
-          dashboard.salesBreakdown.length === 0 ? (
+          dashboardSearchTerm ? (
+            dashboardSearchResults.length === 0 ? (
+              <div className="empty-state">No dashboard results for this search.</div>
+            ) : (
+              <section className="table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Section</th>
+                      <th>Label</th>
+                      <th>Value</th>
+                      <th>Extra</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {dashboardSearchResults.map((item) => (
+                      <tr key={item.id}>
+                        <td>{item.section}</td>
+                        <td>{item.label}</td>
+                        <td>{item.value}</td>
+                        <td>{item.extra}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </section>
+            )
+          ) : dashboardView.kpis.length === 0 &&
+            dashboardView.revenue.length === 0 &&
+            dashboardView.funnel.length === 0 &&
+            dashboardView.salesBreakdown.length === 0 ? (
             <div className="empty-state">No dashboard data available.</div>
           ) : (
           <>
 <section className="kpi-grid">
-          {dashboard.kpis.map((item, index) => (
+          {dashboardView.kpis.map((item, index) => (
             <motion.article
               className="kpi-card glass"
               key={item.label}
@@ -1184,7 +1563,7 @@ function App() {
                   {item.delta}
                 </span>
               </div>
-              <h3>{item.value}</h3>
+              <h3>{item.displayValue || item.value}</h3>
               <p className="kpi-note">Updated just now</p>
             </motion.article>
           ))}
@@ -1207,7 +1586,7 @@ function App() {
           </div>
           <div className="chart-wrap">
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={dashboard.revenue}>
+                <LineChart data={dashboardView.revenue}>
                   <XAxis
                     dataKey="name"
                     axisLine={false}
@@ -1218,7 +1597,7 @@ function App() {
                     axisLine={false}
                     tickLine={false}
                     domain={[0, revenueMax]}
-                    tickFormatter={(value) => `$${value / 1000}k`}
+                    tickFormatter={(value) => formatCurrency(value, true)}
                     tick={{ fill: '#8f97b3', fontSize: 12 }}
                   />
                   <Tooltip
@@ -1249,11 +1628,15 @@ function App() {
               </ResponsiveContainer>
             </div>
             <div className="streams">
-              {dashboard.streams.map((stream) => (
+              {dashboardView.streams.map((stream) => (
                 <div key={stream.label} className="stream">
                   <div>
                     <p>{stream.label}</p>
-                    <span>{stream.amount}</span>
+                    <span>
+                      {stream.amountNumeric === null
+                        ? stream.amount
+                        : formatCurrency(stream.amountNumeric)}
+                    </span>
                   </div>
                   <div className="progress">
                     <div style={{ width: `${stream.share}%` }} />
@@ -1318,7 +1701,7 @@ function App() {
             </div>
             <div className="chart-wrap small">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={dashboard.funnel} barSize={22}>
+                <BarChart data={dashboardView.funnel} barSize={22}>
                   <XAxis
                     dataKey="name"
                     axisLine={false}
@@ -1344,7 +1727,7 @@ function App() {
               </ResponsiveContainer>
             </div>
             <div className="funnel-stats">
-              {dashboard.funnel.map((item) => (
+              {dashboardView.funnel.map((item) => (
                 <div key={item.name}>
                   <p>{item.name}</p>
                   <span>{item.value.toLocaleString()}</span>
@@ -1368,17 +1751,17 @@ function App() {
               <button className="ghost">Full Report</button>
             </div>
             <div className="breakdown">
-              {dashboard.salesBreakdown.map((item) => (
+              {dashboardView.salesBreakdown.map((item) => (
                 <div key={item.name} className="breakdown-row">
                   <span>{item.name}</span>
                   <div className="breakdown-bar">
                     <div
                       style={{
-                        width: `${Math.min(100, (item.value / 60000) * 100)}%`,
+                        width: `${Math.min(100, (item.value / breakdownMax) * 100)}%`,
                       }}
                     />
                   </div>
-                  <strong>${item.value.toLocaleString()}</strong>
+                  <strong>{formatCurrency(item.value)}</strong>
                 </div>
               ))}
             </div>
@@ -1387,29 +1770,67 @@ function App() {
           </>
         )
         ) : (
-                    <section className="module-grid">
+          <section className="module-grid">
             <div className="module-toolbar">
               <div className="module-search glass">
                 <FiSearch />
                 <input
                   type="text"
-                  placeholder={`Search ${moduleLabel.toLowerCase()}...`}
+                  placeholder={
+                    isCnicLookup
+                      ? 'Search customer by CNIC...'
+                      : `Search ${moduleLabel.toLowerCase()}...`
+                  }
                   value={moduleSearch}
                   onChange={(event) => setModuleSearch(event.target.value)}
                 />
               </div>
-              <button
-                className="primary-btn"
-                type="button"
-                onClick={() => openForm("create")}
-              >
-                <FiPlus /> New {moduleLabel}
-              </button>
+              {!isCnicLookup && canCreate && (
+                <button
+                  className="primary-btn"
+                  type="button"
+                  onClick={() => openForm('create')}
+                >
+                  <FiPlus /> New {moduleLabel}
+                </button>
+              )}
             </div>
             {moduleLoading ? (
               <div className="empty-state">Loading data...</div>
             ) : moduleError ? (
               <div className="empty-state">{moduleError}</div>
+            ) : isCnicLookup ? (
+              !cnicSearchTerm ? (
+                <div className="empty-state">CNIC enter karein to customer search ho ga.</div>
+              ) : cnicRows.length === 0 ? (
+                <div className="empty-state">Is CNIC par koi customer nahi mila.</div>
+              ) : (
+                <div className="table-wrap">
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        <th>Name</th>
+                        <th>CNIC</th>
+                        <th>Phone</th>
+                        <th>Address</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {cnicRows.map((row) => {
+                        const rowId = getRowId(row)
+                        return (
+                          <tr key={rowId || `${row.fullName || row.name}-${row.cnic}`}>
+                            <td>{formatValue(row.fullName || row.customerName || row.name)}</td>
+                            <td>{formatValue(row.cnic)}</td>
+                            <td>{formatValue(row.primaryPhone || row.phone)}</td>
+                            <td>{formatValue(row.address)}</td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )
             ) : filteredRows.length === 0 ? (
               <div className="empty-state">No records found.</div>
             ) : (
@@ -1437,40 +1858,47 @@ function App() {
                         <button
                           type="button"
                           className="icon-button"
-                          onClick={() => openForm("view", row)}
+                          onClick={() => openForm('view', row)}
                         >
                           <FiEye />
                         </button>
-                        <button
-                          type="button"
-                          className="icon-button"
-                          onClick={() => openForm("edit", row)}
-                        >
-                          <FiEdit2 />
-                        </button>
-                        <button
-                          type="button"
-                          className="icon-button"
-                          onClick={() => handleDelete(row)}
-                        >
-                          <FiTrash2 />
-                        </button>
+                        {canEdit && (
+                          <button
+                            type="button"
+                            className="icon-button"
+                            onClick={() => openForm('edit', row)}
+                          >
+                            <FiEdit2 />
+                          </button>
+                        )}
+                        {canDelete && (
+                          <button
+                            type="button"
+                            className="icon-button"
+                            onClick={() => handleDelete(row)}
+                          >
+                            <FiTrash2 />
+                          </button>
+                        )}
                       </div>
                     </div>
                   )
                 })}
               </div>
             )}
-          </section>          )}
+          </section>
+        )}
 
         <section className="footer-note">
           {activeItem === "dashboard"
             ? loading
               ? "Syncing live metrics..."
-              : "All metrics are up to date."
+              : dashboardSearchTerm
+                ? `${dashboardSearchResults.length} results found.`
+                : "All metrics are up to date."
             : moduleLoading
               ? "Loading records..."
-              : `${filteredRows.length} records loaded.`}
+              : `${moduleRecordCount} records loaded.`}
         </section>
 
         {isFormOpen && (
@@ -1553,7 +1981,7 @@ function App() {
                   >
                     Cancel
                   </button>
-                  {formMode !== 'view' && (
+                  {formMode !== 'view' && (formMode === 'edit' ? canEdit : canCreate) && (
                     <button className="primary-btn" type="submit" disabled={formSaving}>
                       {formSaving ? 'Saving...' : 'Save'}
                     </button>
